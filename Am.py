@@ -1,6 +1,17 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import io
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+import tempfile
+import os
+import re
 
 # --- DEFAULTS ---
 defaults_str = {
@@ -133,7 +144,7 @@ elif page == pages[1]:
         "AM": [mat_am, manuf_am, transport_am, downtime_am]
     })
 
-    tab1, tab2, tab3 = st.tabs(["Lifecycle Breakdown", "Scenario by Location", "Multi-Country Comparison"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Lifecycle Breakdown", "Scenario by Location", "Multi-Country Comparison", "PDF Report Generator"])
 
     with tab1:
         st.subheader("Lifecycle Stage Emissions (Germany Grid Mix)")
@@ -302,3 +313,507 @@ elif page == pages[1]:
             )
             
             st.plotly_chart(fig_multi, use_container_width=True)
+
+    with tab4:
+        st.subheader("📄 LCA Report - Baseline vs AM Scenario")
+        st.markdown("### Generate a comprehensive GWP comparison report in PDF format")
+        st.markdown("---")
+        
+        # 1. Executive Summary
+        st.header("1. Executive Summary")
+        exec_summary = st.text_area(
+            "Summary Content (English)",
+            value="**Purpose:** Compare GWP between Baseline product and AM (Additive Manufacturing) scenario\n"
+                  "**Key Results:** Country-specific GWP reduction rates\n"
+                  "**Representative Graphic:** World map showing country-level GWP reduction via Bar Chart",
+            height=120,
+            key="exec_summary"
+        )
+        
+        # 2. Methodology
+        st.header("2. Methodology")
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            functional_unit = st.text_input("Functional Unit", value="1 unit of SGT-500 Gas Turbine Blade", key="func_unit")
+            method = st.selectbox("Assessment Method", ["Gate-to-Gate", "Cradle-to-Gate", "Cradle-to-Grave"], key="method")
+        with col_m2:
+            assessment_tool = st.text_input("Assessment Tool", value="OpenLCA / Python-based LCA", key="tool")
+            data_source = st.text_input("Data Source", value="Ecoinvent 3.8, Country-specific grid mix", key="data_source")
+        
+        data_quality = st.text_area(
+            "Data Quality & Assumptions",
+            value="• Data sources: Country-specific energy emission factors, process data from manufacturing sites\n"
+                  "• Assumptions: Standard transportation routes, average downtime periods, material efficiency rates\n"
+                  "• Data quality: Primary data for energy and material use, secondary data for emission factors",
+            height=100,
+            key="data_quality"
+        )
+        
+        # 3. Results - Multi-Country GWP Comparison
+        st.header("3. Results - GWP Comparison")
+        st.markdown("**Baseline vs AM Scenario GWP by Country**")
+        st.info("📌 The data below is automatically calculated based on your input parameters from Page 1")
+        
+        # Calculate for all countries
+        results_data = {
+            'Country': [],
+            'Baseline (kg CO2e)': [],
+            'AM Scenario (kg CO2e)': [],
+            'Reduction (%)': []
+        }
+        
+        for country, grid_val in grid_mix_dict.items():
+            # Standard (Baseline) calculation
+            manuf_std_c = manufacturing_co2(defaults_num["energy_standard"], grid_val)
+            downtime_std_c = downtime_co2(defaults_num["turbine_output"], defaults_num["efficiency_loss"], hours_std, grid_val)
+            total_std_c = mat_std + manuf_std_c + transport_std + downtime_std_c
+            
+            # AM Scenario calculation
+            manuf_am_c = manufacturing_co2(defaults_num["energy_am"], grid_val, defaults_num["argon_use_am"], defaults_num["argon_emission_factor"])
+            downtime_am_c = downtime_co2(defaults_num["turbine_output"], defaults_num["efficiency_loss"], hours_am, grid_val)
+            total_am_c = mat_am + manuf_am_c + transport_am + downtime_am_c
+            
+            # Calculate reduction
+            reduction_pct = ((total_std_c - total_am_c) / total_std_c * 100) if total_std_c > 0 else 0
+            
+            results_data['Country'].append(country)
+            results_data['Baseline (kg CO2e)'].append(round(total_std_c, 2))
+            results_data['AM Scenario (kg CO2e)'].append(round(total_am_c, 2))
+            results_data['Reduction (%)'].append(round(reduction_pct, 1))
+        
+        results_df = pd.DataFrame(results_data)
+        
+        st.dataframe(results_df.style.format({
+            'Baseline (kg CO2e)': '{:.2f}',
+            'AM Scenario (kg CO2e)': '{:.2f}',
+            'Reduction (%)': '{:.1f}%'
+        }).background_gradient(subset=['Reduction (%)'], cmap='Greens'), use_container_width=True)
+        
+        # Allow user to edit results if needed
+        st.markdown("**Optional: Edit results manually for the report**")
+        edited_results = st.data_editor(results_df, num_rows="dynamic", use_container_width=True, key="edited_results")
+        
+        # 4. Visualization Preview
+        st.header("4. Visualization Preview")
+        st.markdown("The following charts will be included in the PDF report:")
+        
+        col_v1, col_v2 = st.columns(2)
+        
+        with col_v1:
+            st.subheader("Bar Chart: Baseline vs AM Scenario")
+            fig_bar = go.Figure()
+            fig_bar.add_trace(go.Bar(
+                name='Baseline',
+                x=edited_results['Country'],
+                y=edited_results['Baseline (kg CO2e)'],
+                marker_color='#5b2c6f',
+                text=edited_results['Baseline (kg CO2e)'].round(1),
+                textposition='outside'
+            ))
+            fig_bar.add_trace(go.Bar(
+                name='AM Scenario',
+                x=edited_results['Country'],
+                y=edited_results['AM Scenario (kg CO2e)'],
+                marker_color='#008b8b',
+                text=edited_results['AM Scenario (kg CO2e)'].round(1),
+                textposition='outside'
+            ))
+            fig_bar.update_layout(
+                barmode='group',
+                xaxis_title='Country',
+                yaxis_title='GWP (kg CO₂e)',
+                height=400,
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+        
+        with col_v2:
+            st.subheader("Dual-line Chart")
+            fig_line = go.Figure()
+            fig_line.add_trace(go.Scatter(
+                x=edited_results['Country'],
+                y=edited_results['Baseline (kg CO2e)'],
+                mode='lines+markers',
+                name='Baseline',
+                line=dict(color='#5b2c6f', width=3),
+                marker=dict(size=10)
+            ))
+            fig_line.add_trace(go.Scatter(
+                x=edited_results['Country'],
+                y=edited_results['AM Scenario (kg CO2e)'],
+                mode='lines+markers',
+                name='AM Scenario',
+                line=dict(color='#008b8b', width=3),
+                marker=dict(size=10)
+            ))
+            fig_line.update_layout(
+                xaxis_title='Country',
+                yaxis_title='GWP (kg CO₂e)',
+                height=400,
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
+        
+        # Reduction percentage bar chart
+        st.subheader("Reduction Rate by Country")
+        fig_reduction = go.Figure()
+        fig_reduction.add_trace(go.Bar(
+            x=edited_results['Country'],
+            y=edited_results['Reduction (%)'],
+            marker_color='#2ecc71',
+            text=edited_results['Reduction (%)'].round(1),
+            texttemplate='%{text}%',
+            textposition='outside'
+        ))
+        fig_reduction.update_layout(
+            xaxis_title='Country',
+            yaxis_title='Reduction (%)',
+            height=350,
+            showlegend=False
+        )
+        st.plotly_chart(fig_reduction, use_container_width=True)
+        
+        # World Map
+        st.subheader("Geographic Distribution of GWP Reduction")
+        fig_map = go.Figure(data=go.Choropleth(
+            locations=edited_results['Country'],
+            locationmode='country names',
+            z=edited_results['Reduction (%)'],
+            text=edited_results['Country'],
+            colorscale='Greens',
+            colorbar_title='Reduction %',
+            marker_line_color='darkgray',
+            marker_line_width=0.5,
+        ))
+        fig_map.update_layout(
+            geo=dict(
+                showframe=False,
+                showcoastlines=True,
+                projection_type='natural earth'
+            ),
+            height=400
+        )
+        st.plotly_chart(fig_map, use_container_width=True)
+        
+        # 5. Interpretation
+        st.header("5. Interpretation")
+        interpretation = st.text_area(
+            "Key Findings & Analysis (English)",
+            value="• AM technology demonstrates GWP reduction benefits across all analyzed countries\n"
+                  "• Reduction rates vary by country due to differences in energy mix and manufacturing process efficiency\n"
+                  "• Countries with higher carbon-intensive grid mix show greater absolute GWP savings\n"
+                  "• Material efficiency improvements (less waste) contribute significantly to overall reduction\n"
+                  "• Reduced transportation distances in AM scenarios provide additional environmental benefits",
+            height=150,
+            key="interpretation"
+        )
+        
+        # 6. Conclusion
+        st.header("6. Conclusion")
+        conclusion = st.text_area(
+            "Conclusion (English)",
+            value="• GWP reduction through AM adoption shows positive environmental impact\n"
+                  "• Country-specific strategies are necessary considering different energy mix profiles\n"
+                  "• AM technology offers substantial benefits in material efficiency and supply chain optimization\n"
+                  "• Continued monitoring and optimization of AM processes recommended for maximum GWP reduction",
+            height=120,
+            key="conclusion"
+        )
+        
+        # Additional notes
+        st.header("7. Additional Information (Optional)")
+        col_add1, col_add2 = st.columns(2)
+        with col_add1:
+            report_author = st.text_input("Report Author", value="LCA Engineering Team", key="author")
+            organization = st.text_input("Organization", value="Siemens Energy", key="org")
+        with col_add2:
+            project_name = st.text_input("Project Name", value="Gas Turbine Blade LCA Study", key="project")
+            report_version = st.text_input("Report Version", value="v1.0", key="version")
+        
+        # PDF Generation Function
+        def format_text_for_pdf(text):
+            """Convert markdown-style bold (**text**) to HTML bold tags and escape HTML entities"""
+            # Escape HTML special characters first
+            text = text.replace('&', '&amp;')
+            text = text.replace('<', '&lt;')
+            text = text.replace('>', '&gt;')
+            # Replace **text** with <b>text</b>
+            text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+            return text
+        
+        def escape_html(text):
+            """Escape HTML special characters"""
+            text = str(text)
+            text = text.replace('&', '&amp;')
+            text = text.replace('<', '&lt;')
+            text = text.replace('>', '&gt;')
+            return text
+        
+        def create_lca_pdf_report(data_df, exec_sum, func_unit, assess_method, tool, data_src, 
+                                 data_qual, interpret, concl, author, org, project, version,
+                                 fig_bar, fig_line, fig_reduction, fig_map):
+            """Generate comprehensive LCA PDF report"""
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=A4, 
+                                   rightMargin=50, leftMargin=50, 
+                                   topMargin=50, bottomMargin=30)
+            
+            story = []
+            styles = getSampleStyleSheet()
+            
+            # Custom styles
+            title_style = ParagraphStyle(
+                'ReportTitle',
+                parent=styles['Heading1'],
+                fontSize=22,
+                textColor=colors.HexColor('#5b2c6f'),
+                spaceAfter=20,
+                alignment=TA_CENTER,
+                fontName='Helvetica-Bold'
+            )
+            
+            heading1_style = ParagraphStyle(
+                'CustomHeading1',
+                parent=styles['Heading1'],
+                fontSize=16,
+                textColor=colors.HexColor('#5b2c6f'),
+                spaceAfter=12,
+                spaceBefore=12,
+                fontName='Helvetica-Bold'
+            )
+            
+            heading2_style = ParagraphStyle(
+                'CustomHeading2',
+                parent=styles['Heading2'],
+                fontSize=13,
+                textColor=colors.HexColor('#008b8b'),
+                spaceAfter=8,
+                spaceBefore=8,
+                fontName='Helvetica-Bold'
+            )
+            
+            # Report Title
+            story.append(Paragraph("LCA Report", title_style))
+            story.append(Paragraph("Baseline vs AM Scenario - GWP Comparison", heading2_style))
+            story.append(Spacer(1, 15))
+            
+            # Report metadata
+            metadata = f"""
+            <b>Project:</b> {escape_html(project)}<br/>
+            <b>Organization:</b> {escape_html(org)}<br/>
+            <b>Author:</b> {escape_html(author)}<br/>
+            <b>Version:</b> {escape_html(version)}<br/>
+            <b>Date:</b> {datetime.now().strftime('%B %d, %Y')}
+            """
+            story.append(Paragraph(metadata, styles['Normal']))
+            story.append(Spacer(1, 30))
+            story.append(PageBreak())
+            
+            # 1. Executive Summary
+            story.append(Paragraph("1. Executive Summary", heading1_style))
+            story.append(Spacer(1, 10))
+            for line in exec_sum.split('\n'):
+                if line.strip():
+                    formatted_line = format_text_for_pdf(line)
+                    story.append(Paragraph(formatted_line, styles['Normal']))
+                    story.append(Spacer(1, 8))
+            story.append(Spacer(1, 20))
+            
+            # 2. Methodology
+            story.append(Paragraph("2. Methodology", heading1_style))
+            story.append(Spacer(1, 10))
+            
+            methodology_content = f"""
+            <b>Functional Unit:</b> {escape_html(func_unit)}<br/>
+            <b>Assessment Method:</b> {escape_html(assess_method)}<br/>
+            <b>Assessment Tool:</b> {escape_html(tool)}<br/>
+            <b>Data Source:</b> {escape_html(data_src)}<br/>
+            """
+            story.append(Paragraph(methodology_content, styles['Normal']))
+            story.append(Spacer(1, 12))
+            
+            story.append(Paragraph("<b>Data Quality & Assumptions:</b>", styles['Normal']))
+            story.append(Spacer(1, 8))
+            for line in data_qual.split('\n'):
+                if line.strip():
+                    formatted_line = format_text_for_pdf(line)
+                    story.append(Paragraph(formatted_line, styles['Normal']))
+                    story.append(Spacer(1, 6))
+            
+            story.append(PageBreak())
+            
+            # 3. Results
+            story.append(Paragraph("3. Results - GWP Comparison", heading1_style))
+            story.append(Spacer(1, 10))
+            story.append(Paragraph("Country-level Baseline vs AM Scenario GWP:", heading2_style))
+            story.append(Spacer(1, 12))
+            
+            # Results table
+            table_data = [['Country', 'Baseline\n(kg CO₂e)', 'AM Scenario\n(kg CO₂e)', 'Reduction\n(%)']]
+            for _, row in data_df.iterrows():
+                table_data.append([
+                    row['Country'],
+                    f"{row['Baseline (kg CO2e)']:.2f}",
+                    f"{row['AM Scenario (kg CO2e)']:.2f}",
+                    f"{row['Reduction (%)']}%"
+                ])
+            
+            # Add statistics row
+            avg_baseline = data_df['Baseline (kg CO2e)'].mean()
+            avg_am = data_df['AM Scenario (kg CO2e)'].mean()
+            avg_reduction = data_df['Reduction (%)'].mean()
+            table_data.append(['Average', f"{avg_baseline:.2f}", f"{avg_am:.2f}", f"{avg_reduction:.1f}%"])
+            
+            results_table = Table(table_data, colWidths=[2*inch, 1.5*inch, 1.5*inch, 1.2*inch])
+            results_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#5b2c6f')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('TOPPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -2), colors.HexColor('#f5f5f5')),
+                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#e0e0e0')),
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+                ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#f9f9f9')])
+            ]))
+            story.append(results_table)
+            story.append(PageBreak())
+            
+            # 4. Visualization
+            story.append(Paragraph("4. Visualization", heading1_style))
+            story.append(Spacer(1, 15))
+            
+            # Save charts as temporary images
+            temp_files = []
+            
+            try:
+                # Bar Chart
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp1:
+                    fig_bar.write_image(tmp1.name, width=900, height=500, scale=2)
+                    temp_files.append(tmp1.name)
+                    story.append(Paragraph("Bar Chart: Country-level Baseline vs AM Scenario GWP", heading2_style))
+                    story.append(Spacer(1, 8))
+                    img1 = Image(tmp1.name, width=6*inch, height=3.3*inch)
+                    story.append(img1)
+                    story.append(Spacer(1, 20))
+                
+                # Line Chart
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp2:
+                    fig_line.write_image(tmp2.name, width=900, height=500, scale=2)
+                    temp_files.append(tmp2.name)
+                    story.append(Paragraph("Dual-line Chart: Trend Comparison (Baseline vs AM)", heading2_style))
+                    story.append(Spacer(1, 8))
+                    img2 = Image(tmp2.name, width=6*inch, height=3.3*inch)
+                    story.append(img2)
+                
+                story.append(PageBreak())
+                
+                # Reduction Chart
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp3:
+                    fig_reduction.write_image(tmp3.name, width=900, height=450, scale=2)
+                    temp_files.append(tmp3.name)
+                    story.append(Paragraph("GWP Reduction Rate by Country", heading2_style))
+                    story.append(Spacer(1, 8))
+                    img3 = Image(tmp3.name, width=6*inch, height=3*inch)
+                    story.append(img3)
+                    story.append(Spacer(1, 20))
+                
+                # World Map
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp4:
+                    fig_map.write_image(tmp4.name, width=900, height=500, scale=2)
+                    temp_files.append(tmp4.name)
+                    story.append(Paragraph("Geographic Distribution: Reduction Map (World View)", heading2_style))
+                    story.append(Spacer(1, 8))
+                    img4 = Image(tmp4.name, width=6*inch, height=3.3*inch)
+                    story.append(img4)
+                
+                story.append(PageBreak())
+                
+                # 5. Interpretation
+                story.append(Paragraph("5. Interpretation", heading1_style))
+                story.append(Spacer(1, 10))
+                for line in interpret.split('\n'):
+                    if line.strip():
+                        formatted_line = format_text_for_pdf(line)
+                        story.append(Paragraph(formatted_line, styles['Normal']))
+                        story.append(Spacer(1, 8))
+                story.append(Spacer(1, 20))
+                
+                # 6. Conclusion
+                story.append(Paragraph("6. Conclusion", heading1_style))
+                story.append(Spacer(1, 10))
+                for line in concl.split('\n'):
+                    if line.strip():
+                        formatted_line = format_text_for_pdf(line)
+                        story.append(Paragraph(formatted_line, styles['Normal']))
+                        story.append(Spacer(1, 8))
+                
+                # Build PDF
+                doc.build(story)
+                buffer.seek(0)
+                
+                return buffer, temp_files
+                
+            except Exception as e:
+                raise Exception(f"Error creating PDF: {str(e)}")
+        
+        # Generate PDF Button
+        st.markdown("---")
+        st.header("8. Generate PDF Report")
+        
+        if st.button("🎯 Generate PDF Report", type="primary", key="generate_pdf"):
+            if not edited_results.empty:
+                try:
+                    with st.spinner("Generating comprehensive PDF report... This may take a moment."):
+                        pdf_buffer, temp_files = create_lca_pdf_report(
+                            edited_results, 
+                            exec_summary,
+                            functional_unit,
+                            method,
+                            assessment_tool,
+                            data_source,
+                            data_quality,
+                            interpretation,
+                            conclusion,
+                            report_author,
+                            organization,
+                            project_name,
+                            report_version,
+                            fig_bar,
+                            fig_line,
+                            fig_reduction,
+                            fig_map
+                        )
+                    
+                    st.success("✅ PDF Report Generated Successfully!")
+                    
+                    filename = f"LCA_Report_Baseline_vs_AM_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                    st.download_button(
+                        label="📥 Download PDF Report",
+                        data=pdf_buffer,
+                        file_name=filename,
+                        mime="application/pdf",
+                        key="download_pdf"
+                    )
+                    
+                    # Clean up temporary files
+                    for tmp_file in temp_files:
+                        try:
+                            if os.path.exists(tmp_file):
+                                os.remove(tmp_file)
+                        except:
+                            pass
+                    
+                    st.info("💡 The PDF includes all sections with visualizations and detailed analysis.")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error generating PDF: {str(e)}")
+                    st.info("**Troubleshooting:** Make sure `kaleido` package is installed:\n```\npip install kaleido\n```")
+            else:
+                st.warning("⚠ Please ensure results data is available before generating the report.")
